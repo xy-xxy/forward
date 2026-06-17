@@ -16,7 +16,12 @@ echo [2/5] go mod tidy
 go mod tidy
 if errorlevel 1 goto :err
 
-echo [3/5] manifest resource (rsrc_windows.syso)
+echo [3/5] manifest + icon resource (rsrc_windows.syso)
+if not exist forward.ico (
+    echo   generating forward.ico...
+    go run ./tools/genicon -o forward.ico
+    if errorlevel 1 goto :err
+)
 if not exist rsrc_windows.syso (
     where rsrc >nul 2>nul
     if errorlevel 1 (
@@ -24,7 +29,7 @@ if not exist rsrc_windows.syso (
         go install github.com/akavel/rsrc@latest
         if errorlevel 1 goto :err
     )
-    rsrc -manifest forward.manifest -o rsrc_windows.syso
+    rsrc -manifest forward.manifest -ico forward.ico -o rsrc_windows.syso
     if errorlevel 1 goto :err
 )
 

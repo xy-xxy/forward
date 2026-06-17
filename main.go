@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"runtime/debug"
 	"strconv"
@@ -25,15 +26,20 @@ import (
 // ============ 配置 ============
 
 type Rule struct {
-	Listen string `json:"listen"`
-	Target string `json:"target"`
-	Proto  string `json:"proto"`
+	Listen string   `json:"listen"`
+	Target string   `json:"target"`
+	Proto  string   `json:"proto"`
+	Allow  []string `json:"allow,omitempty"`
+	Deny   []string `json:"deny,omitempty"`
 }
 
 type Config struct {
-	Rules      []Rule `json:"rules"`
-	UDPBuffer  int    `json:"udpBuffer"`
-	UDPTimeout int    `json:"udpTimeout"`
+	Rules         []Rule   `json:"rules"`
+	UDPBuffer     int      `json:"udpBuffer"`
+	UDPTimeout    int      `json:"udpTimeout"`
+	DefaultPolicy string   `json:"defaultPolicy,omitempty"` // "allow" / "deny",默认 allow
+	Allow         []string `json:"allow,omitempty"`
+	Deny          []string `json:"deny,omitempty"`
 }
 
 const (
@@ -108,6 +114,8 @@ func expandRule(r Rule) ([]Rule, error) {
 				Listen: fmt.Sprintf("%s:%d", ls.Host, p),
 				Target: fmt.Sprintf("%s:%d", ts.Host, ts.StartPort),
 				Proto:  r.Proto,
+				Allow:  r.Allow,
+				Deny:   r.Deny,
 			})
 		}
 		return out, nil
@@ -121,6 +129,8 @@ func expandRule(r Rule) ([]Rule, error) {
 			Listen: fmt.Sprintf("%s:%d", ls.Host, ls.StartPort+i),
 			Target: fmt.Sprintf("%s:%d", ts.Host, ts.StartPort+i),
 			Proto:  r.Proto,
+			Allow:  r.Allow,
+			Deny:   r.Deny,
 		})
 	}
 	return out, nil
@@ -137,16 +147,23 @@ type Forwarder struct {
 	listeners []net.Listener
 	udpConns  []*net.UDPConn
 
+	activeMu    sync.Mutex
+	activeConns map[io.Closer]struct{}
+
 	running atomic.Bool
 
 	tcpConns    atomic.Int64
 	udpSessions atomic.Int64
 	bytesIn     atomic.Int64
 	bytesOut    atomic.Int64
+	denied      atomic.Int64
 
 	sessionsMu sync.Mutex
 	sessions   map[int64]*SessionInfo
 	nextID     atomic.Int64
+
+	globalACL    compiledACL
+	defaultAllow bool
 
 	onLog func(string)
 }
@@ -178,7 +195,25 @@ type SessionSnapshot struct {
 }
 
 func NewForwarder(onLog func(string)) *Forwarder {
-	return &Forwarder{onLog: onLog, sessions: make(map[int64]*SessionInfo)}
+	return &Forwarder{
+		onLog:       onLog,
+		sessions:    make(map[int64]*SessionInfo),
+		activeConns: make(map[io.Closer]struct{}),
+	}
+}
+
+func (f *Forwarder) trackConn(c io.Closer) {
+	f.activeMu.Lock()
+	if f.activeConns != nil {
+		f.activeConns[c] = struct{}{}
+	}
+	f.activeMu.Unlock()
+}
+
+func (f *Forwarder) untrackConn(c io.Closer) {
+	f.activeMu.Lock()
+	delete(f.activeConns, c)
+	f.activeMu.Unlock()
 }
 
 func (f *Forwarder) registerSession(proto, client, listen, target string) *SessionInfo {
@@ -240,8 +275,12 @@ func (f *Forwarder) Start(cfg Config) error {
 	f.udpSessions.Store(0)
 	f.bytesIn.Store(0)
 	f.bytesOut.Store(0)
+	f.denied.Store(0)
 	f.listeners = nil
 	f.udpConns = nil
+	f.activeMu.Lock()
+	f.activeConns = make(map[io.Closer]struct{})
+	f.activeMu.Unlock()
 	f.sessionsMu.Lock()
 	f.sessions = make(map[int64]*SessionInfo)
 	f.sessionsMu.Unlock()
@@ -251,6 +290,19 @@ func (f *Forwarder) Start(cfg Config) error {
 	}
 	if cfg.UDPTimeout <= 0 {
 		cfg.UDPTimeout = defaultUDPTimeout
+	}
+
+	// 编译全局 ACL
+	g, err := compileACL(cfg.Allow, cfg.Deny)
+	if err != nil {
+		f.running.Store(false)
+		return fmt.Errorf("全局 ACL 解析失败: %w", err)
+	}
+	f.globalACL = g
+	f.defaultAllow = !strings.EqualFold(strings.TrimSpace(cfg.DefaultPolicy), "deny")
+	if !g.empty() || !f.defaultAllow {
+		f.log("ACL 已启用: 默认=%s allow=%d 条 deny=%d 条",
+			policyName(f.defaultAllow), len(g.allow), len(g.deny))
 	}
 
 	// 展开端口范围
@@ -268,23 +320,35 @@ func (f *Forwarder) Start(cfg Config) error {
 	}
 
 	for _, rule := range expanded {
+		ruleACL, err := compileACL(rule.Allow, rule.Deny)
+		if err != nil {
+			f.log("规则 ACL 解析失败 %s: %v", rule.Listen, err)
+			continue
+		}
 		p := rule.Proto
 		if p == "" {
 			p = "both"
 		}
 		if p == "tcp" || p == "both" {
-			if err := f.startTCP(rule); err != nil {
+			if err := f.startTCP(rule, ruleACL); err != nil {
 				f.log("[TCP] %s 监听失败: %v", rule.Listen, err)
 			}
 		}
 		if p == "udp" || p == "both" {
-			if err := f.startUDP(rule, cfg.UDPBuffer, time.Duration(cfg.UDPTimeout)*time.Second); err != nil {
+			if err := f.startUDP(rule, ruleACL, cfg.UDPBuffer, time.Duration(cfg.UDPTimeout)*time.Second); err != nil {
 				f.log("[UDP] %s 监听失败: %v", rule.Listen, err)
 			}
 		}
 	}
 	f.log("转发已启动")
 	return nil
+}
+
+func policyName(allow bool) string {
+	if allow {
+		return "allow"
+	}
+	return "deny"
 }
 
 func (f *Forwarder) Stop() {
@@ -302,6 +366,20 @@ func (f *Forwarder) Stop() {
 	f.listeners = nil
 	f.udpConns = nil
 	f.closeMu.Unlock()
+
+	// 强制 close 所有活跃的 TCP/UDP 会话连接,让阻塞在 Read 的 goroutine 立刻返回。
+	// 不这么做的话,TCP 会等到对端 RST/FIN 或 keepalive 超时(几十分钟),Stop 会卡住。
+	f.activeMu.Lock()
+	conns := make([]io.Closer, 0, len(f.activeConns))
+	for c := range f.activeConns {
+		conns = append(conns, c)
+	}
+	f.activeConns = make(map[io.Closer]struct{})
+	f.activeMu.Unlock()
+	for _, c := range conns {
+		c.Close()
+	}
+
 	f.wg.Wait()
 	debug.FreeOSMemory()
 	f.log("转发已停止")
@@ -309,7 +387,7 @@ func (f *Forwarder) Stop() {
 
 // ---- TCP ----
 
-func (f *Forwarder) startTCP(rule Rule) error {
+func (f *Forwarder) startTCP(rule Rule, acl compiledACL) error {
 	ln, err := net.Listen("tcp", rule.Listen)
 	if err != nil {
 		return err
@@ -333,6 +411,13 @@ func (f *Forwarder) startTCP(rule Rule) error {
 					return
 				}
 			}
+			remote := conn.RemoteAddr().String()
+			if ip := extractIP(remote); !aclPermit(ip, acl, f.globalACL, f.defaultAllow) {
+				f.denied.Add(1)
+				f.log("[TCP] 拒绝 %s -> %s (客户端 %s 不在白名单或命中黑名单)", rule.Listen, rule.Target, remote)
+				conn.Close()
+				continue
+			}
 			f.wg.Add(1)
 			go func() {
 				defer f.wg.Done()
@@ -345,12 +430,17 @@ func (f *Forwarder) startTCP(rule Rule) error {
 
 func (f *Forwarder) handleTCP(client net.Conn, listen, target string) {
 	defer client.Close()
+	f.trackConn(client)
+	defer f.untrackConn(client)
+
 	server, err := net.Dial("tcp", target)
 	if err != nil {
 		f.log("[TCP] 连接目标 %s 失败: %v", target, err)
 		return
 	}
 	defer server.Close()
+	f.trackConn(server)
+	defer f.untrackConn(server)
 
 	sess := f.registerSession("tcp", client.RemoteAddr().String(), listen, target)
 	defer f.unregisterSession(sess.ID)
@@ -400,7 +490,7 @@ type udpSession struct {
 	info       *SessionInfo
 }
 
-func (f *Forwarder) startUDP(rule Rule, bufSize int, timeout time.Duration) error {
+func (f *Forwarder) startUDP(rule Rule, acl compiledACL, bufSize int, timeout time.Duration) error {
 	listenAddr, err := net.ResolveUDPAddr("udp", rule.Listen)
 	if err != nil {
 		return err
@@ -440,6 +530,7 @@ func (f *Forwarder) startUDP(rule Rule, bufSize int, timeout time.Duration) erro
 				now := time.Now().UnixNano()
 				for k, s := range sessions {
 					if time.Duration(now-s.lastActive.Load()) > timeout {
+						f.untrackConn(s.serverConn)
 						s.serverConn.Close()
 						delete(sessions, k)
 						f.udpSessions.Add(-1)
@@ -468,12 +559,18 @@ func (f *Forwarder) startUDP(rule Rule, bufSize int, timeout time.Duration) erro
 					return
 				}
 			}
-			f.bytesIn.Add(int64(n))
 			key := clientAddr.String()
 
 			sessMu.Lock()
 			sess, ok := sessions[key]
 			if !ok {
+				// 新会话:ACL 检查
+				if !aclPermit(clientAddr.IP, acl, f.globalACL, f.defaultAllow) {
+					sessMu.Unlock()
+					f.denied.Add(1)
+					f.log("[UDP] 拒绝 %s -> %s (客户端 %s 不在白名单或命中黑名单)", rule.Listen, rule.Target, key)
+					continue
+				}
 				srvConn, err := net.DialUDP("udp", nil, targetAddr)
 				if err != nil {
 					sessMu.Unlock()
@@ -483,6 +580,7 @@ func (f *Forwarder) startUDP(rule Rule, bufSize int, timeout time.Duration) erro
 				// 每会话 socket：单条客户端流量，512KB 足够
 				srvConn.SetReadBuffer(512 * 1024)
 				srvConn.SetWriteBuffer(512 * 1024)
+				f.trackConn(srvConn)
 				sess = &udpSession{serverConn: srvConn}
 				sess.lastActive.Store(time.Now().UnixNano())
 				sess.info = f.registerSession("udp", key, rule.Listen, rule.Target)
@@ -510,6 +608,7 @@ func (f *Forwarder) startUDP(rule Rule, bufSize int, timeout time.Duration) erro
 					}
 				}(clientAddr, sess)
 			}
+			f.bytesIn.Add(int64(n))
 			sess.lastActive.Store(time.Now().UnixNano())
 			if sess.info != nil {
 				sess.info.BytesIn.Add(int64(n))
