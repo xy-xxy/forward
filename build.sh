@@ -3,8 +3,15 @@
 # 用法:
 #   ./build.sh            # 编译当前平台
 #   ./build.sh upx        # 编译 + UPX 压缩（需要先 apt install upx 或 yum install upx）
+#   ./build.sh all        # 多平台、多架构构建，输出到 dist
 
 set -euo pipefail
+
+cd "$(dirname "$0")"
+if [ "${1:-}" = "all" ]; then
+    shift
+    exec go run ./tools/build "$@"
+fi
 
 echo "[1/3] Go version:"
 go version

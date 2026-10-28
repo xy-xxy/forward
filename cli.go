@@ -70,6 +70,8 @@ const helpText = `Forward — TCP/UDP 端口转发 & 接口测试工具
   -echo                  监听模式:收到包后回 echo
   -interval <seconds>    发送模式:循环间隔(默认 0 = 单次)
   -timeout <seconds>     发送模式:等待响应的最长时间(默认 1)
+  -bandwidth             TCP 带宽测试，两端均需启用；忽略 payload/echo/interval
+  -duration <seconds>    带宽发送时长(1～3600 秒，默认 10)
 
 通用:
   -h, -help              显示这段帮助
@@ -99,6 +101,10 @@ const helpText = `Forward — TCP/UDP 端口转发 & 接口测试工具
   # B 机:每秒往 A 机 9999 发一次 "hello"
   forward -probe send -addr A机IP:9999 -payload hello -interval 1
 
+  # TCP 带宽: A 机监听，B 机持续发送 10 秒
+  forward -probe listen -addr 0.0.0.0:9999 -bandwidth
+  forward -probe send -addr A机IP:9999 -bandwidth -duration 10
+
   # 同上,但中间穿过 forward 转发:
   #   B 机 -> forward(监听) -> A 机(监听 echo) -> 看 B 机有没有收到响应
 `
@@ -125,12 +131,16 @@ func main() {
 	probeEcho := flag.Bool("echo", false, "监听模式:收到后回 echo")
 	probeInterval := flag.Int("interval", 0, "发送模式:循环间隔(秒,0=单次)")
 	probeTimeout := flag.Int("timeout", 1, "发送模式:等待响应的最长时间(秒)")
+	probeBandwidth := flag.Bool("bandwidth", false, "TCP 带宽测试(两端均需启用)")
+	probeDuration := flag.Int("duration", 10, "带宽发送时长(秒，1～3600)")
 
 	flag.Parse()
 
 	// 接口测试模式
 	if *probeMode != "" {
-		runProbeCLI(*probeMode, *probeAddr, *proto, *probePayload, *probeEcho, *probeInterval, *probeTimeout)
+		if code := runProbeCLI(*probeMode, *probeAddr, *proto, *probePayload, *probeEcho, *probeInterval, *probeTimeout, *probeBandwidth, *probeDuration); code != 0 {
+			os.Exit(code)
+		}
 		return
 	}
 
@@ -176,13 +186,17 @@ func runCLI(configFile, listenAddr, targetAddr, proto string) {
 	logger.Println("已退出")
 }
 
-func runProbeCLI(mode, addr, proto, payload string, echo bool, intervalSec, timeoutSec int) {
+func runProbeCLI(mode, addr, proto, payload string, echo bool, intervalSec, timeoutSec int, bandwidth bool, durationSec int) int {
+	if bandwidth && (durationSec < 1 || durationSec > 3600) {
+		fmt.Fprintln(os.Stderr, "-duration 必须为 1～3600 秒")
+		return 2
+	}
 	if proto != "tcp" && proto != "udp" {
 		proto = "tcp"
 	}
 	if addr == "" {
 		fmt.Fprintln(os.Stderr, "缺少 -addr 参数")
-		os.Exit(2)
+		return 2
 	}
 
 	var pm ProbeMode
@@ -193,7 +207,7 @@ func runProbeCLI(mode, addr, proto, payload string, echo bool, intervalSec, time
 		pm = ProbeSend
 	default:
 		fmt.Fprintf(os.Stderr, "-probe 取值必须是 listen 或 send,而不是 %q\n", mode)
-		os.Exit(2)
+		return 2
 	}
 
 	logger, closeLog := newCLILogger()
@@ -208,10 +222,42 @@ func runProbeCLI(mode, addr, proto, payload string, echo bool, intervalSec, time
 		Echo:        echo,
 		Interval:    time.Duration(intervalSec) * time.Second,
 		ReadTimeout: time.Duration(timeoutSec) * time.Second,
+		Bandwidth:   bandwidth,
+		Duration:    time.Duration(durationSec) * time.Second,
 	}
 	if err := probe.Start(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
-		os.Exit(1)
+		return 1
+	}
+	if bandwidth {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		defer signal.Stop(sigCh)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		previous := probe.BandwidthSnapshot()
+		previousTime := time.Now()
+		for {
+			select {
+			case <-sigCh:
+				probe.Stop()
+				return 0
+			case <-probe.Done():
+				if probe.BandwidthSnapshot().Error != "" {
+					return 1
+				}
+				return 0
+			case now := <-ticker.C:
+				current := probe.BandwidthSnapshot()
+				if current.Active && current.Generation == previous.Generation {
+					logger.Printf("[带宽] 实时发送 %.2f Mbps，接收 %.2f Mbps；累计发送 %s，接收 %s",
+						bandwidthMbps(current.Sent-previous.Sent, now.Sub(previousTime)),
+						bandwidthMbps(current.Received-previous.Received, now.Sub(previousTime)),
+						humanBytes(current.Sent), humanBytes(current.Received))
+				}
+				previous, previousTime = current, now
+			}
+		}
 	}
 
 	// send 模式 + 单次:发完读响应就退出
@@ -220,7 +266,7 @@ func runProbeCLI(mode, addr, proto, payload string, echo bool, intervalSec, time
 		time.Sleep(time.Duration(timeoutSec)*time.Second + 200*time.Millisecond)
 		probe.Stop()
 		logger.Printf("发送 %s 字节,接收 %s 字节", humanBytes(probe.Sent()), humanBytes(probe.Recv()))
-		return
+		return 0
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -229,4 +275,5 @@ func runProbeCLI(mode, addr, proto, payload string, echo bool, intervalSec, time
 	logger.Println("收到中断信号，正在停止...")
 	probe.Stop()
 	logger.Printf("发送 %s 字节,接收 %s 字节", humanBytes(probe.Sent()), humanBytes(probe.Recv()))
+	return 0
 }

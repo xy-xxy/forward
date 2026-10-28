@@ -1,6 +1,45 @@
 # Forward 发布说明
 
-## 当前开发版本
+## v1.1.0 · 2026-10-28
+
+### 本次更新
+
+- Windows「接口测试」标签页新增 TCP 带宽测试，可设置 1～3600 秒的发送时长，默认 10 秒。
+- 显示实时/平均 Mbps、传输量，以及接收端回报的实际接收字节数和平均速率。
+- 支持经过 Forward 转发链路测速；发送完成后自动结束，监听端继续等待下一次连接。
+- CLI 新增 `-bandwidth` 和 `-duration` 参数，Linux/macOS 可作为测速对端。两端均需使用新版 Forward 并启用带宽模式。
+- 改进测试连接跟踪和停止流程，支持取消阻塞发送及重复启动。
+- 新增统一多平台构建入口，按 Windows 架构生成图标/manifest 资源，并输出 SHA256 校验文件。
+
+### 发行文件
+
+| 系统 | 架构 | 文件 |
+| --- | --- | --- |
+| Windows | amd64 / 386 | `forward_windows_amd64.exe` / `forward_windows_386.exe` |
+| Linux | amd64 / 386 | `forward_linux_amd64` / `forward_linux_386` |
+| Linux | arm64 / armv7 | `forward_linux_arm64` / `forward_linux_armv7` |
+| macOS | amd64 / arm64 | `forward_darwin_amd64` / `forward_darwin_arm64` |
+
+下载对应系统与架构的文件；Linux/macOS 下赋予执行权限后运行。`SHA256SUMS` 包含上述 8 个可执行文件的 SHA256。
+
+### 带宽测试示例
+
+```bash
+# 接收端
+./forward_linux_amd64 -probe listen -addr 0.0.0.0:9999 -proto tcp -bandwidth
+# 发送端：替换为实际接收端地址
+./forward_linux_amd64 -probe send -addr 192.0.2.10:9999 -proto tcp -bandwidth -duration 10
+```
+
+### 验证与兼容性
+
+- 使用 Go 1.20.14 构建全部 8 个目标，以保留 Windows Server 2012 兼容性。
+- 已通过竞态检测测试、宿主机及 Windows amd64 静态检查。
+- 已验证直连/经过转发器的测速、重复启动、取消阻塞发送、错误对端、传输中断及 TCP/UDP echo 回归。
+- macOS ARM64 CLI 收发、实时统计、参数校验与 SIGTERM 停止已验证。
+- Windows GUI 和其他目标系统尚未实机验证；Windows ARM64 暂不提供。测速使用 Forward 专用 TCP 协议，不兼容 iperf 或普通 echo 监听端。
+
+## 项目概览
 
 Forward 是一个使用 Go 编写的轻量级 TCP/UDP 端口转发工具。Windows 提供图形界面，Linux 和 macOS 提供命令行模式。
 
@@ -20,6 +59,7 @@ Forward 是一个使用 Go 编写的轻量级 TCP/UDP 端口转发工具。Windo
 - 使用 Go 1.20.x 构建，以保持 Windows Server 2012 兼容性。
 - Linux/macOS：运行 `./build.sh`；使用 `./build.sh upx` 启用压缩。
 - Windows：运行 `build.bat` 构建 GUI；运行 `build.bat linux` 同时生成 Linux 版本。
+- 多平台：使用 Go 1.20.14 运行 `go run ./tools/build`，或运行 `./build.sh all` / `build.bat all`。
 
 ### 使用示例
 
@@ -31,4 +71,4 @@ Forward 是一个使用 Go 编写的轻量级 TCP/UDP 端口转发工具。Windo
 
 ### 注意事项
 
-发布前请检查监听地址、目标地址以及 `allow`、`deny` 和 `defaultPolicy` 配置。当前仓库没有独立单元测试，建议使用 `go vet ./...` 和内置 probe 完成发布验证。
+部署前请检查监听地址、目标地址以及 `allow`、`deny` 和 `defaultPolicy` 配置。可运行 `go test -race ./...`、`go vet ./...`，并使用内置 probe 完成实际链路验证。

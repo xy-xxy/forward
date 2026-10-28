@@ -9,6 +9,7 @@
 - **UDP 会话保持**,按客户端地址聚合,空闲超时自动回收
 - **黑/白名单(ACL)**:支持单 IP 和 CIDR,可设全局或每条规则,支持默认策略
 - **实时统计**:连接数、UDP 会话数、字节数、速率、拒绝次数,GUI 下还能看到每条会话的详情
+- **TCP 带宽测试**:指定发送时长，查看实时/平均 Mbps、传输量和对端实际接收结果，支持经过转发链路测速
 - **跨平台**:Windows GUI(单文件 exe)+ Linux / macOS CLI
 - **零依赖运行**,编译产物单文件,UPX 压缩后通常 < 2 MB
 - 兼容 **Windows Server 2012**(用 Go 1.20.x 编译即可)
@@ -52,6 +53,43 @@ build.bat linux        :: 同时交叉编译出 Linux 版 forward
 ./build.sh upx         # 编译 + UPX 压缩(需先安装 upx)
 ```
 
+### 多平台、多架构构建
+
+在项目根目录运行，使用 Go **1.20.14**（保留 Windows Server 2012 兼容性）：
+
+```bash
+go run ./tools/build
+# 或 Linux/macOS: ./build.sh all
+# 或 Windows: build.bat all
+```
+
+新版 Go 可先设置 `GOTOOLCHAIN=go1.20.14`，工具链会在首次运行时自动下载：
+
+```bash
+GOTOOLCHAIN=go1.20.14 ./build.sh all
+```
+
+Windows cmd 中使用 `set GOTOOLCHAIN=go1.20.14`，然后运行 `build.bat all`。
+
+默认产物写入 `dist/`，以 `forward_<系统>_<架构>` 命名，Windows 附加 `.exe`：
+
+| 系统 | 架构 | 运行方式 |
+| --- | --- | --- |
+| Windows | amd64、386 | GUI / CLI |
+| Linux | amd64、386、arm64、armv7 | CLI |
+| macOS | amd64、arm64 | CLI |
+
+指定部分目标或输出目录：
+
+```bash
+go run ./tools/build -targets linux/amd64,linux/arm64,darwin/arm64 -out dist
+go run ./tools/build -targets linux/arm/v6,linux/arm/v7
+```
+
+构建不修改项目中的二进制、依赖文件或 Windows 资源；每个 Windows 架构均在临时目录生成对应资源，资源生成器固定为 `github.com/akavel/rsrc@v0.10.2`。首次构建需要联网下载依赖。产物不执行 UPX 压缩，完成后生成本次目标的 `SHA256SUMS`。输出目录中的其他文件会保留。
+
+Windows ARM64 暂未支持。交叉编译成功不代表已完成各目标系统的运行验证；发布前应在对应系统测试，尤其是 Windows Server 2012。
+
 ## 使用
 
 ### CLI(任意平台)
@@ -88,6 +126,32 @@ forward.exe
 ```
 
 界面里可以增删改规则、保存为 `forward.json`、一键启停、查看实时会话表与流量速率。
+
+### TCP 带宽测试
+
+两端均需使用包含带宽功能的 Forward。测试的是发送端到监听端的单条 TCP 连接吞吐量，速率单位为 **Mbps**（每秒百万比特）。
+
+在 Windows 的「接口测试」标签页操作：
+
+1. 接收端选择「监听(收包)」，勾选「测带宽 (TCP)」，填写本地监听地址，例如 `0.0.0.0:9999`，点击「开始」。
+2. 发送端选择「发送(发包)」，同样勾选「测带宽 (TCP)」，填写接收端地址，设置测速时长（默认 10 秒，范围 1～3600 秒），点击「开始」。
+3. 界面每半秒刷新实时速率、平均速率和累计传输量。发送结束后自动释放连接、恢复开始按钮，并显示对端实收字节数与平均速率。监听端继续等待下一次测试。
+
+任意时刻可点击「停止」。交换两端角色可测试反向带宽。开启带宽模式后，发送内容、echo 和循环间隔不参与测试；每个监听端一次接收一个测速连接。
+
+Linux/macOS 或 Windows 命令行也可作为测试对端：
+
+```bash
+# 接收端：启动 TCP 带宽监听
+./forward -probe listen -addr 0.0.0.0:9999 -proto tcp -bandwidth
+
+# 发送端：替换为接收端 IP，持续发送 10 秒后自动退出
+./forward -probe send -addr 192.168.1.10:9999 -proto tcp -bandwidth -duration 10
+```
+
+测试转发链路时，将发送端地址改为转发器的监听地址，转发目标指向带宽监听端。测速客户端/服务端与转发器应使用不同的进程；GUI 中转发和接口测试不能同时运行。
+
+最终结果以「对端实收」为准；实时发送量表示本机写入连接的载荷字节。统计不包含协议头，测试结果受链路、单连接 TCP、CPU 和转发性能影响。测试到时会完成当前数据帧并等待结果；无响应时最多等待约 5 秒后报错。该模式使用 Forward 专用协议，不兼容 iperf 或普通 echo 监听端。
 
 ## 配置文件
 

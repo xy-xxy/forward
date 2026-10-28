@@ -3,10 +3,16 @@ REM Forward build script (Windows)
 REM Usage:
 REM   build.bat              -> build Windows GUI exe
 REM   build.bat linux        -> ALSO cross-compile Linux binary
+REM   build.bat all          -> build all supported targets into dist
 REM
 REM For Windows Server 2012 compatibility, use Go 1.20.x
 
 setlocal
+cd /d "%~dp0"
+if /I "%~1"=="all" (
+    go run ./tools/build
+    exit /b
+)
 
 echo [1/5] Go version:
 go version

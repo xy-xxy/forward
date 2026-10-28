@@ -639,10 +639,14 @@ func runGUI() {
 	// Probe tab 的控件
 	var probeModeListen, probeModeSend *walk.RadioButton
 	var probeProto *walk.ComboBox
-	var probeAddr, probePayload, probeInterval *walk.LineEdit
-	var probeEcho, probeRepeat *walk.CheckBox
+	var probeAddr, probePayload, probeInterval, probeDuration *walk.LineEdit
+	var probeEcho, probeRepeat, probeBandwidth *walk.CheckBox
 	var probeStartBtn, probeStopBtn *walk.PushButton
 	var probeStat *walk.Label
+	var probeBandwidthStat *walk.TextLabel
+	var probeStopping bool
+	var bandwidthSample BandwidthStats
+	var bandwidthSampleTime time.Time
 	var probe *Probe
 
 	// updateProbeUI 的前向声明,setStatus 内部会调用它(fwd 启动/停止时同步)
@@ -745,24 +749,31 @@ func runGUI() {
 
 	// 同步 probe 控件的启用状态。转发运行时整个 tab 锁定。
 	updateProbeUI = func() {
-		if probeModeListen == nil {
+		if probeModeListen == nil || probeBandwidth == nil || probeBandwidthStat == nil {
 			return
 		}
 		isListen := probeModeListen.Checked()
 		probeRunning := probe.Running()
 		fwdRunning := fwd.Running()
-		locked := probeRunning || fwdRunning // 锁定所有输入
+		locked := probeRunning || probeStopping || fwdRunning // 锁定所有输入
 
 		probeStartBtn.SetEnabled(!locked)
-		probeStopBtn.SetEnabled(probeRunning)
+		probeStopBtn.SetEnabled(probeRunning && !probeStopping)
 		probeModeListen.SetEnabled(!locked)
 		probeModeSend.SetEnabled(!locked)
-		probeProto.SetEnabled(!locked)
+		bandwidth := probeBandwidth.Checked()
+		if bandwidth {
+			probeProto.SetCurrentIndex(0)
+		}
+		probeBandwidth.SetEnabled(!locked)
+		probeDuration.SetEnabled(!locked && bandwidth && !isListen)
+		probeBandwidthStat.SetVisible(bandwidth)
+		probeProto.SetEnabled(!locked && !bandwidth)
 		probeAddr.SetEnabled(!locked)
-		probeEcho.SetEnabled(!locked && isListen)
-		probePayload.SetEnabled(!locked && !isListen)
-		probeRepeat.SetEnabled(!locked && !isListen)
-		probeInterval.SetEnabled(!locked && !isListen && probeRepeat.Checked())
+		probeEcho.SetEnabled(!locked && isListen && !bandwidth)
+		probePayload.SetEnabled(!locked && !isListen && !bandwidth)
+		probeRepeat.SetEnabled(!locked && !isListen && !bandwidth)
+		probeInterval.SetEnabled(!locked && !isListen && !bandwidth && probeRepeat.Checked())
 	}
 
 	const btnW = 72
@@ -784,6 +795,10 @@ func runGUI() {
 						MinSize:     Size{Width: btnW},
 						ToolTipText: "按当前规则启动所有 TCP/UDP 转发",
 						OnClicked: func() {
+							if probe.Running() || probeStopping {
+								walk.MsgBox(mw, "提示", "请先停止接口测试再启动转发", walk.MsgBoxIconWarning)
+								return
+							}
 							if model.RowCount() == 0 {
 								walk.MsgBox(mw, "提示", "请先添加至少一条转发规则", walk.MsgBoxIconWarning)
 								return
@@ -1010,6 +1025,12 @@ func runGUI() {
 												ToolTipText: "向目标地址主动发送数据,验证链路",
 												OnClicked:   func() { updateProbeUI() },
 											},
+											CheckBox{
+												AssignTo:         &probeBandwidth,
+												Text:             "测带宽 (TCP)",
+												ToolTipText:      "两端均需启用；从发送端向监听端持续传输，统计实际吞吐量",
+												OnCheckedChanged: func() { updateProbeUI() },
+											},
 											HSpacer{},
 										},
 									},
@@ -1030,6 +1051,10 @@ func runGUI() {
 												CueBanner:   "监听:0.0.0.0:9999  发送:1.2.3.4:9999",
 												ToolTipText: "监听:本机绑定地址;发送:对端目标地址",
 											},
+
+											Label{Text: "测速时长(秒):"},
+											LineEdit{AssignTo: &probeDuration, Text: "10", ToolTipText: "发送端测试时长：1～3600 秒；监听端持续等待连接"},
+											TextLabel{Text: "两端勾选测带宽，先监听再发送。交换角色可测试反向带宽。", ColumnSpan: 2, MinSize: Size{Width: 100}},
 
 											Label{Text: "发送内容:"},
 											LineEdit{
@@ -1072,8 +1097,9 @@ func runGUI() {
 														return
 													}
 													cfg := ProbeConfig{
-														Proto: probeProto.Text(),
-														Addr:  strings.TrimSpace(probeAddr.Text()),
+														Proto:     probeProto.Text(),
+														Addr:      strings.TrimSpace(probeAddr.Text()),
+														Bandwidth: probeBandwidth.Checked(),
 													}
 													if cfg.Addr == "" {
 														walk.MsgBox(mw, "提示", "请填写地址", walk.MsgBoxIconWarning)
@@ -1084,17 +1110,26 @@ func runGUI() {
 														cfg.Echo = probeEcho.Checked()
 													} else {
 														cfg.Mode = ProbeSend
-														cfg.Payload = []byte(probePayload.Text())
-														if len(cfg.Payload) == 0 {
-															walk.MsgBox(mw, "提示", "请填写发送内容", walk.MsgBoxIconWarning)
-															return
-														}
-														if probeRepeat.Checked() {
-															sec, _ := strconv.Atoi(strings.TrimSpace(probeInterval.Text()))
-															if sec < 1 {
-																sec = 1
+														if cfg.Bandwidth {
+															seconds, err := strconv.Atoi(strings.TrimSpace(probeDuration.Text()))
+															if err != nil || seconds < 1 || seconds > 3600 {
+																walk.MsgBox(mw, "提示", "测速时长请输入 1～3600 秒", walk.MsgBoxIconWarning)
+																return
 															}
-															cfg.Interval = time.Duration(sec) * time.Second
+															cfg.Duration = time.Duration(seconds) * time.Second
+														} else {
+															cfg.Payload = []byte(probePayload.Text())
+															if len(cfg.Payload) == 0 {
+																walk.MsgBox(mw, "提示", "请填写发送内容", walk.MsgBoxIconWarning)
+																return
+															}
+															if probeRepeat.Checked() {
+																sec, _ := strconv.Atoi(strings.TrimSpace(probeInterval.Text()))
+																if sec < 1 {
+																	sec = 1
+																}
+																cfg.Interval = time.Duration(sec) * time.Second
+															}
 														}
 													}
 													if err := probe.Start(cfg); err != nil {
@@ -1111,11 +1146,13 @@ func runGUI() {
 												Enabled:     false,
 												ToolTipText: "停止当前测试",
 												OnClicked: func() {
+													probeStopping = true
 													probeStopBtn.SetEnabled(false)
 													probeStopBtn.SetText("停止…")
 													go func() {
 														probe.Stop()
 														mw.Synchronize(func() {
+															probeStopping = false
 															probeStopBtn.SetText("停止")
 															updateProbeUI()
 														})
@@ -1125,6 +1162,12 @@ func runGUI() {
 											Label{AssignTo: &probeStat, Text: "已发: 0 B   已收: 0 B"},
 											HSpacer{},
 										},
+									},
+									TextLabel{
+										AssignTo: &probeBandwidthStat,
+										Text:     "等待连接\r\n实时发送: 0.00 Mbps   接收: 0.00 Mbps\r\n平均发送: 0.00 Mbps   接收: 0.00 Mbps",
+										MinSize:  Size{Width: 100},
+										Visible:  false,
 									},
 									VSpacer{},
 								},
@@ -1281,9 +1324,11 @@ func runGUI() {
 				prevIn = in
 				prevOut = out
 
-				probeSent := probe.Sent()
-				probeRecv := probe.Recv()
 				mw.Synchronize(func() {
+					if uiClosed.Load() {
+						return
+					}
+
 					lblTcp.SetText(fmt.Sprintf("%d", tcp))
 					lblUdp.SetText(fmt.Sprintf("%d", udp))
 					lblIn.SetText(humanBytes(in))
@@ -1293,8 +1338,29 @@ func runGUI() {
 					lblDenied.SetText(fmt.Sprintf("%d", denied))
 					sessionModel.SetItems(sessions)
 					if probeStat != nil {
-						probeStat.SetText(fmt.Sprintf("已发: %s   已收: %s", humanBytes(probeSent), humanBytes(probeRecv)))
+						probeStat.SetText(fmt.Sprintf("已发: %s   已收: %s", humanBytes(probe.Sent()), humanBytes(probe.Recv())))
 					}
+					snapshot := probe.BandwidthSnapshot()
+					sampledAt := time.Now()
+					var sentMbps, recvMbps float64
+					if snapshot.Active && snapshot.Generation == bandwidthSample.Generation && !bandwidthSampleTime.IsZero() {
+						elapsed := sampledAt.Sub(bandwidthSampleTime)
+						sentMbps = bandwidthMbps(snapshot.Sent-bandwidthSample.Sent, elapsed)
+						recvMbps = bandwidthMbps(snapshot.Received-bandwidthSample.Received, elapsed)
+					}
+					bandwidthSample, bandwidthSampleTime = snapshot, sampledAt
+					if snapshot.Enabled {
+						summary := fmt.Sprintf("%s · %.1f 秒\r\n实时发送: %.2f Mbps   接收: %.2f Mbps\r\n平均发送: %.2f Mbps   接收: %.2f Mbps", snapshot.Status, snapshot.Elapsed.Seconds(), sentMbps, recvMbps, bandwidthMbps(snapshot.Sent, snapshot.Elapsed), bandwidthMbps(snapshot.Received, snapshot.Elapsed))
+						if snapshot.PeerReceived > 0 {
+							summary += fmt.Sprintf("\r\n对端实收: %s   平均: %.2f Mbps", humanBytes(snapshot.PeerReceived), bandwidthMbps(snapshot.PeerReceived, snapshot.PeerElapsed))
+						}
+						if snapshot.Error != "" {
+							summary += "\r\n" + snapshot.Error
+						}
+						probeBandwidthStat.SetText(summary)
+					}
+					updateProbeUI()
+
 				})
 			}
 		}

@@ -32,19 +32,27 @@ type ProbeConfig struct {
 	Interval    time.Duration // 0 = 单次;>0 = 定时循环
 	Echo        bool          // listen 模式:收到后回 echo
 	ReadTimeout time.Duration // send 模式:等待响应的时长,默认 1s
+	Bandwidth   bool          // TCP 带宽测试；两端均需启用
+	Duration    time.Duration // 带宽发送时长，默认 10s
 }
 
 type Probe struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	lifecycleMu sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	done        chan struct{}
 
 	running atomic.Bool
 	sent    atomic.Int64
 	recv    atomic.Int64
 
 	closeMu sync.Mutex
-	closers []io.Closer
+	closers map[io.Closer]struct{}
+
+	bandwidthBusy atomic.Bool
+	statsMu       sync.Mutex
+	stats         BandwidthStats
 
 	onLog func(string)
 }
@@ -65,7 +73,18 @@ func (p *Probe) log(format string, args ...interface{}) {
 
 func (p *Probe) trackCloser(c io.Closer) {
 	p.closeMu.Lock()
-	p.closers = append(p.closers, c)
+	defer p.closeMu.Unlock()
+	if p.ctx.Err() != nil {
+		c.Close()
+		return
+	}
+	p.closers[c] = struct{}{}
+}
+
+func (p *Probe) releaseCloser(c io.Closer) {
+	c.Close()
+	p.closeMu.Lock()
+	delete(p.closers, c)
 	p.closeMu.Unlock()
 }
 
@@ -74,18 +93,36 @@ func (p *Probe) closeAll() {
 	cs := p.closers
 	p.closers = nil
 	p.closeMu.Unlock()
-	for _, c := range cs {
+	for c := range cs {
 		c.Close()
 	}
 }
 
 func (p *Probe) Start(cfg ProbeConfig) error {
-	if !p.running.CompareAndSwap(false, true) {
-		return fmt.Errorf("已经在运行")
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.done != nil {
+		select {
+		case <-p.done:
+		default:
+			return fmt.Errorf("已经在运行")
+		}
 	}
+	if cfg.Bandwidth {
+		if cfg.Proto != "tcp" {
+			return fmt.Errorf("带宽测试仅支持 TCP，两端均需启用带宽测试")
+		}
+		if cfg.Duration == 0 {
+			cfg.Duration = 10 * time.Second
+		}
+		if cfg.Duration < 0 || cfg.Duration > time.Hour {
+			return fmt.Errorf("带宽测试时长必须大于 0 且不超过 3600 秒")
+		}
+	}
+	p.running.Store(true)
 	p.ctx, p.cancel = context.WithCancel(context.Background())
-	p.sent.Store(0)
-	p.recv.Store(0)
+	p.closers = make(map[io.Closer]struct{})
+	p.resetBandwidthStats(cfg.Bandwidth)
 	if cfg.ReadTimeout <= 0 {
 		cfg.ReadTimeout = time.Second
 	}
@@ -104,7 +141,15 @@ func (p *Probe) Start(cfg ProbeConfig) error {
 	case ProbeSend:
 		switch cfg.Proto {
 		case "tcp":
-			p.startTCPSend(cfg)
+			if cfg.Bandwidth {
+				p.wg.Add(1)
+				go func() {
+					defer p.wg.Done()
+					p.sendBandwidth(cfg)
+				}()
+			} else {
+				p.startTCPSend(cfg)
+			}
 		case "udp":
 			p.startUDPSend(cfg)
 		default:
@@ -119,17 +164,44 @@ func (p *Probe) Start(cfg ProbeConfig) error {
 		p.cancel()
 		return err
 	}
+	p.done = make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		p.cancel()
+		p.closeAll()
+		p.running.Store(false)
+		close(p.done)
+	}()
 	return nil
 }
 
 func (p *Probe) Stop() {
-	if !p.running.CompareAndSwap(true, false) {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.done == nil {
 		return
+	}
+	select {
+	case <-p.done:
+		return
+	default:
 	}
 	p.cancel()
 	p.closeAll()
-	p.wg.Wait()
+	<-p.done
+	p.statsMu.Lock()
+	if p.stats.Enabled {
+		p.stats.Status = "已停止"
+	}
+	p.statsMu.Unlock()
 	p.log("已停止")
+}
+
+// Done 在本次测试所有 goroutine 和连接清理后关闭。
+func (p *Probe) Done() <-chan struct{} {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	return p.done
 }
 
 // ============ TCP 监听 ============
@@ -141,6 +213,9 @@ func (p *Probe) startTCPListen(cfg ProbeConfig) error {
 	}
 	p.trackCloser(ln)
 	p.log("[TCP 监听] %s 启动 (echo=%v)", cfg.Addr, cfg.Echo)
+	if cfg.Bandwidth {
+		p.log("[带宽] 等待发送端连接；每次接收一个测试，完成后继续监听")
+	}
 
 	p.wg.Add(1)
 	go func() {
@@ -159,7 +234,11 @@ func (p *Probe) startTCPListen(cfg ProbeConfig) error {
 			p.wg.Add(1)
 			go func() {
 				defer p.wg.Done()
-				p.handleTCPConn(conn, cfg.Echo)
+				if cfg.Bandwidth {
+					p.receiveBandwidth(conn)
+				} else {
+					p.handleTCPConn(conn, cfg.Echo)
+				}
 			}()
 		}
 	}()
@@ -167,8 +246,8 @@ func (p *Probe) startTCPListen(cfg ProbeConfig) error {
 }
 
 func (p *Probe) handleTCPConn(conn net.Conn, echo bool) {
-	defer conn.Close()
 	p.trackCloser(conn)
+	defer p.releaseCloser(conn)
 	remote := conn.RemoteAddr().String()
 	p.log("[TCP 监听] 客户端接入: %s", remote)
 	buf := make([]byte, 64*1024)
@@ -265,7 +344,7 @@ func (p *Probe) doTCPSend(cfg ProbeConfig) {
 		return
 	}
 	p.trackCloser(conn)
-	defer conn.Close()
+	defer p.releaseCloser(conn)
 
 	n, err := conn.Write(cfg.Payload)
 	if err != nil {
@@ -325,7 +404,7 @@ func (p *Probe) doUDPSend(cfg ProbeConfig) {
 		return
 	}
 	p.trackCloser(conn)
-	defer conn.Close()
+	defer p.releaseCloser(conn)
 
 	n, err := conn.Write(cfg.Payload)
 	if err != nil {
